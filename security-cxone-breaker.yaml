@@ -6,15 +6,15 @@ steps:
       targetType: 'inline'
       script: |
         # -- Variables de entorno
-        PROJECT_NAME=
-        BRANCH=
-        CLIENT_ID=
-        CLIENT_SECRET=
-        SCAN_ID=
-        PROJECT_ID=
+        PROJECT_NAME="${PROJECT_NAME_ENV}"
+        BRANCH="${BRANCH_ENV}"
+        CLIENT_ID="${CX_CLIENT_ID}"
+        CLIENT_SECRET="${CX_CLIENT_SECRET}"
+        SCAN_ID="${SCAN_ID_ENV}"
+        PROJECT_ID="${PROJECT_ID_ENV}"
 
         # -- Variables de control
-        CXONE_TOKEN=
+        CXONE_TOKEN=""
         CXONE_SEVERITY_FILTER="CRITICAL,HIGH"
         CX_URL_AST="https://ast.checkmarx.net/api"
         LINEA_BASE_ID=""
@@ -36,7 +36,7 @@ steps:
           echo " - ProjectName: ${PROJECT_NAME}"
           echo " - ScanId: ${SCAN_ID}"
           echo " - ClientId: $( [ -n "$CLIENT_ID" ] && echo 'Configurado' || echo 'FALTANTE' )"
-          }
+
           if [ -z "${PROJECT_NAME}" ] || [ "${PROJECT_NAME}" == "null" ]; then
             echo "##vso[task.logissue type=error] Error: Project Name es nulo o no está definido."
             exit 1
@@ -86,28 +86,81 @@ steps:
           local search_url="${CX_URL_AST}/projects?name=${project_name_encoded}"
 
           local response=$(curl -s -w "\n%{http_code}" -X GET "$search_url" \
-              -H "Autorization: Bearer ${CXONE_TOKEN}" \
+              -H "Authorization: Bearer ${CXONE_TOKEN}" \
               -H "Accept: application/json")
           
           local http_code=$(echo "$response" | tail -n1)
-          local body=$(echo "$response" | sed "$d")
+          local body=$(echo "$response" | sed '$d')
 
           if [ "$http_code" -eq 200 ]; then
-            PROJECT_ID=$(echo $"body" | jq -r --arg name "$PROJECT_NAME" '
+            PROJECT_ID=$(echo "$body" | jq -r --arg name "$PROJECT_NAME" '
               (if type == "object" and .projects then .projects else . end)
               | map(select(.name == $name))
               | .[0].id 
             ')
-            if [-n "$PROJECT_ID" ]; then
+            if [ -n "$PROJECT_ID" ]; then
                 echo "[OK] ProjectID: ${PROJECT_ID}"
             else
                 echo "##vso[task.logissue type=error]: No existe el proyecto '${PROJECT_NAME}'."
                 exit 1
             fi
           else
-            echo "##vso[task.logissue type:error] Error API CxOne Projects: Codigo ${http_code}"
+            echo "##vso[task.logissue type=error] Error API CxOne Projects: Codigo ${http_code}"
             echo "Detalle: ${body}"
             exit 1
           fi 
         }
+
+        # -- Peticion Generica a la API
+        make_api_request() {
+          local url="$1"
+          local method="$2"
+          local body="$3"
+          local extra_args=()
+
+          if [ -n "$body" ]; then
+            extra_args=(-H "Content-type: application/json" -d "$body")
+          fi 
+
+          local response=$(curl -s -w "\n%{http_code}" -X "$method" "$url" \
+              -H "Authorization: Bearer ${CXONE_TOKEN}" \
+              -H "Accept: application/json; version=1.0" \
+              "${extra_args[@]}")
+          
+          API_STATUS=$(echo "$response" | tail -n1)
+          API_BODY=$(echo "$response" | sed '$d')
+
+          if [ "$API_STATUS" -ge 200 ] && [ "$API_STATUS" -lt 400 ]; then
+              return 0
+          else
+              return 1
+          fi
+        }
+
+        
+
+        # -- 
+
+        # -- main
+        main() {
+            echo "##vso[group] Preparación y Autenticación"
+
+            validate_identifiers
+            get_token_iam
+            if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" == "null" ]; then
+                get_projectID
+            fi
+
+            echo "##[endgroup]"
+        }
+
+        main
+
+    env:
+      PROJECT_NAME_ENV: ${{ parameters.project_name }}
+      BRANCH_ENV: ${{ parameters.branch }}
+      CX_CLIENT_ID: ${{ parameters.cx_client_id }}
+      CX_CLIENT_SECRET: ${{ parameters.cx_secret }}
+      SCAN_ID_ENV: ${{ parameters.scan_id }}
+      PROJECT_ID_ENV: ${{ parameters.project_id }}
 
