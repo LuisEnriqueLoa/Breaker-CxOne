@@ -1,6 +1,3 @@
-# Breaker-CxOne
-## Diagrama de flujo de seguridad
-
 ```mermaid
 flowchart TD
     subgraph GLOBAL[Imports y Variables Globales]
@@ -16,15 +13,15 @@ flowchart TD
     end
 
     subgraph AUTH[Conectividad y Autenticación]
-        G[obtenerIdentificadores()]
-        H[obtenerToken()]
-        I[obtenerProjectID()]
+        G["obtenerIdentificadores()"]
+        H["obtenerToken()"]
+        I["obtenerProjectID()"]
     end
 
     subgraph SAST[SAST - Validación de Vulnerabilidades]
-        J[realizarPeticion()]
-        K[functionCompartivaScaneoBase()]
-        L[functionValidacionDeVulnerabilidades()]
+        J[realizarPeticion]
+        K[functionComparativaScaneoBase]
+        L[functionValidacionDeVulnerabilidades]
     end
 
     subgraph BASE[Línea Base]
