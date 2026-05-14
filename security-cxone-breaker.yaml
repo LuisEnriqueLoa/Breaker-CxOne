@@ -15,9 +15,10 @@ steps:
 
         # -- Variables de control
         CXONE_TOKEN=""
-        CXONE_SEVERITY_FILTER="CRITICAL,HIGH"
+        SEVERITY=("CRITICAL" "HIGH")
+        SEVERITY_STR="CRITICAL,HIGH"
         CX_URL_AST="https://ast.checkmarx.net/api"
-        LINEA_BASE_ID=""
+        BASELINE_ID=""
 
         # -- Control de fallos
         SAST_FAILED=false
@@ -69,6 +70,7 @@ steps:
             CXONE_TOKEN=$(echo "$body" | jq -r '.access_token')
             if [ -z "$CXONE_TOKEN" ] || [ "$CXONE_TOKEN" == "null" ]; then
               echo "##vso[task.logissue type=error] Error: Token extraído es nulo."
+              exit 1
             fi
             echo "[OK] Token obtenido exitosamente."
           else
@@ -137,23 +139,336 @@ steps:
           fi
         }
 
-        
+        # -- Validar estado del escaneo
+        check_scan_status() {
+          echo "[INFO] Verificando el estado del escaneo: ${SCAN_ID}..."
+          local url="${CX_URL_AST}/scans/${SCAN_ID}"
 
-        # -- 
+          make_api_request "$url" "GET"
+
+          if [ "$API_STATUS" -eq 200 ]; then
+            local status=$(echo "$API_BODY" | jq -r '.status')
+            echo "[INFO] Estado reportado por API CxOne: ${status}"
+            if [ "$status" != "Completed" ] && [ "$status" != "Partial" ]; then
+              echo "##vso[task.logissue type=error] Error Fatal: El escaneo falló internamente en la plataforma. Estado actual: ${status}"
+              exit 1
+            fi 
+          else
+            echo "##vso[task.logissue type=error] Error API Check Scan Status: Código ${API_STATUS}"
+            exit 1
+          fi 
+        }
+
+        # -- Validacion directa SAST (sin linea base)
+        sast_direct_validation() {
+          echo "[INFO] Iniciando validación SAST directa (Sin Línea Base)..."
+          sleep 5
+
+          local sast_json_path="${AGENT_TEMPDIRECTORY:-.}/cxone_sast_direct.json"
+          rm -f "$sast_json_path"
+
+          for sev in "${SEVERITY[@]}"; do 
+            if [ "$SAST_FAILED" = true ]; then break; fi 
+
+            local queryString="?scan-id=${SCAN_ID}&severity=${sev}&group-by-field=STATE"
+            local url="${CX_URL_AST}/sast-scan-summary/aggregate${queryString}"
+            make_api_request "$url" "GET"
+
+            if [ "$API_STATUS" -ne 200 ]; then
+              echo "##vso[task.logissue type=error] Error API SAST Aggregate (${sev}): Código ${API_STATUS}"
+              SAST_FAILED=true
+              break
+            fi 
+
+            local active=$(echo "$API_BODY" | jq -r '
+              if .summaries then
+                [.summaries[] | select((.state | gsub("_";"") | ascii_downcase) != "notexploitable") | .count] | add // 0 
+              else 0 end
+            ')
+
+            if [ "$sev" == "CRITICAL" ]; then SAST_CRIT=$active; fi 
+            if [ "$sev" == "HIGH" ]; then SAST_HIGH=$active; fi 
+
+            echo "$API_BODY" >> "$sast_json_path"
+          done
+
+          echo "##vso[task.setvariable variable=CX_SAST_JSON_PATH]$sast_json_path"
+
+          echo "[INFO] RESULTADO SAST (Análisis Directo):"
+          echo " - CRITICAL (Activas) : ${SAST_CRIT}"
+          echo " - HIGH     (Activas) : ${SAST_HIGH}"
+
+          if [ "$SAST_CRIT" -gt 0 ] || [ "$SAST_HIGH" -gt 0 ] || [ "$SAST_FAILED" = true ]; then
+            echo "[!] Se detectaron vulnerabilidades activas"
+            SAST_FAILED=true
+            make_api_request "${CX_URL_AST}/scans/${SCAN_ID}/tags" "PUT" '{"tags":{"Break SAST Fallo":""}}'
+          else
+            echo "[OK] SAST Aprobado. Cero riesgos activos."
+            make_api_request "${CX_URL_AST}/scans/${SCAN_ID}/tags" "PUT" '{"tags":{"Break SAST OK":""}}'
+          fi
+        }
+
+        # -- Validacion Diferencial SAST (Con linea base)
+        sast_comparative_validation() {
+          echo "[INFO] Iniciando validación SAST comparativa (Contra línea base: ${BASELINE_ID})..."
+          sleep 5
+
+          local queryString="?base-scan-id=${BASELINE_ID}&scan-id=${SCAN_ID}&severity=${SEVERITY_STR}&status=NEW,RECURRENT&limit=5000"
+          local url="${CX_URL_AST}/sast-results/compare${queryString}"
+          make_api_request "$url" "GET"
+
+          if [ "$API_STATUS" -ne 200 ]; then
+            echo "##vso[task.logissue type=error] Error API SAST Comparativa: Código ${API_STATUS}"
+            echo "Detalle: ${API_BODY}"
+            SAST_FAILED=true
+            return
+          fi 
+
+          local sast_json_path="${AGENT_TEMPDIRECTORY:-.}/cxone_sast_compare.json"
+          echo "$API_BODY" > "$sast_json_path"
+          echo "##vso[task.setvariable variable=CX_SAST_JSON_PATH]$sast_json_path" 
+
+          for sev in "${SEVERITY[@]}"; do
+            local count=$(echo "$API_BODY" | jq -r --arg s "$sev" '
+            if .results then
+              [.results[] | select(.status == "NEW" and (.state | gsub("_";"") | ascii_downcase) != "notexploitable" and .severity == $s)] | length
+            else 0 end')
+
+            if [ "$sev" == "CRITICAL" ]; then
+              SAST_CRIT=$count
+              echo " - Nuevas CRITICAL (Activas) : ${SAST_CRIT}"
+            elif [ "$sev" == "HIGH" ]; then
+              SAST_HIGH=$count
+              echo " - Nuevas HIGH (Activas)     : ${SAST_HIGH}"
+            fi
+          done
+
+          if [ "$SAST_CRIT" -gt 0 ] || [ "$SAST_HIGH" -gt 0 ] || [ "$SAST_FAILED" = true ]; then
+            echo "[!] Se detectaron vulnerabilidades NUEVAS respecto a la línea base."
+            SAST_FAILED=true
+            make_api_request "${CX_URL_AST}/scans/${SCAN_ID}/tags" "PUT" '{"tags":{"Break SAST Fallo":""}}'
+          else
+            echo "[OK] SAST Aprobado. Cero riesgos activos."
+            make_api_request "${CX_URL_AST}/scans/${SCAN_ID}/tags" "PUT" '{"tags":{"Break SAST OK":""}}'
+          fi
+        }
+
+        # -- Selector evaluacion general SAST (Obtener linea base)
+        sast_baseline_evaluation() {
+          echo "##[group] Evaluación SAST" 
+          echo "[INFO] Buscando escaneo previo (Línea base) en ramas main/master..."
+
+          local branches=("main" "master")
+          local baseline=false
+
+          for branch in "${branches[@]}"; do 
+            if [ "$baseline" = true ]; then break; fi 
+            echo " Buscando escaneo exitoso en rama: ${branch}..."
+
+            local queryString="?offset=0&limit=1&project-id=${PROJECT_ID}&branch=${branch}&statuses=Completed&sort=-created_at&tags-keys=Break%20SAST%20OK"
+            local url="${CX_URL_AST}/scans${queryString}"
+            make_api_request "$url" "GET"
+
+            if [ "$API_STATUS" -eq 200 ]; then
+              local baseline_id=$(echo "$API_BODY" | jq -r '.scans[0].id // empty')
+              if [ -n "$baseline_id" ] && [ "$baseline_id" != "null" ]; then
+                BASELINE_ID="$baseline_id"
+                baseline=true
+                echo "[OK] Línea base detectada: [ID: ${BASELINE_ID}] en rama [${branch}]."
+              fi 
+            fi 
+          done
+
+          if [ "$baseline" = true ]; then
+            echo "[INFO] Ejecutando comparación diferencial"
+            sast_comparative_validation
+          else
+            echo "[INFO] Ejecutando validación directa (No se encontro linea base)"
+            sast_direct_validation
+          fi 
+          echo "##[endgroup]"
+        }
+
+        # -- Exportacion y Evaluacion SCA 
+        sca_evaluation() {
+          echo "##[group] Exportación y Evaluación SCA" 
+          echo "[INFO] Solicitando exportacion SCA a la API CxOne..."
+
+          local body="{\"scanId\":\"${SCAN_ID}\",\"fileFormat\":\"ScanReportJson\",\"exportParameters\":{\"hideDevAndTestDependencies\":false,\"showOnlyEffectiveLicenses\":false}}"
+          make_api_request "{CX_URL_AST}/sca/export/requests" "POST" "$body"
+
+          if [ "$API_STATUS" -lt 200 ] || [ "$API_STATUS" -gt 299 ]; then
+            echo "##vso[task.logissue type=error] Error: Fallo al solicitar exportación SCA. Código: "$API_STATUS"
+            SCA_FAILED=true
+            return
+          fi 
+
+          local export_id=$(echo "$API_BODY" | jq -r '.exportId')
+          echo "[INFO] ID scaneo SCA: ${export_id}, esperando procesamiento..."
+
+          local max_retries=${SCA_MAXRETRIES:-30}
+          local retries=0
+          local export_status=""
+
+          while [ "$retries" -lt "$max_retries" ]; do 
+            make_api_request "${CX_URL_AST}/sca/export/requests?exportId=${export_id}" "GET"
+            export_status=$(echo "$API_BODY" | jq -r '.exportStatus')
+          
+            echo " >> Estado: ${export_status} (Solicitud $((retries + 1)))"
+
+            if [ "$export_status" == "Completed" ]; then
+              echo "[OK] Reporte CSA generado exitosamente."
+              break
+            fi 
+            if [ "$export_status" == "Failed" ] || [ "$export_status" == "Canceled" ]; then
+              echo "##vso[task.logissue type=error] Error: La exportacion del reporte CSA fallo (${export_status})"
+              SCA_FAILED=true
+              return
+            fi 
+            retries=$((retries + 1))
+            sleep 10
+          done
+
+          if [ "$export_status" != "Completed" ]; then
+            echo "##vso[task.logissue type=error] Timeout esperando resporte SCA"
+            SCA_FAILED=true
+            return
+          fi 
+
+          # -- Descarga y evaluacion
+          echo "[INFO] Aplicando reglas de negocio..."
+          make_api_request "${CX_URL_AST}/sca/export/requests/${export_id}/download" "GET"
+
+          if [ "$API_STATUS" -ne 200 ]; then
+            echo "##vso[task.logissue type=error] Error: Fallo al descargar reporte SCA. Codigo: ${API_STATUS}"
+            SCA_FAILED=true
+            return
+          fi 
+
+          local sca_json_path="${AGENT_TEMPDIRECTORY:-.}/cxone_sca_breaker.json"
+          echo "$API_BODY" > "$sca_json_path"
+          echo "##vso[task.setvariable variable=CX_SCA_JSON_PATH]$sca_json_path"
+          
+          # -- Reglas de negocio SCA
+          local violations=$(echo "$API_BODY" | jq -r '
+            # Con reduce convertimos un array a diccionario, 
+            (reduce .Packages[] as $p ({}; .$[$p.Id] = $p)) as $pkgs |
+            [
+              .Vulnerabilities[] |
+              . as $v |
+              $pkgs[$v.PackageId] as $p |
+              select(($v.RiskState == null) or (($v.RiskState | type == "string") and ($v.RiskState | gsub("_";"") | ascii_downcase) != "notexploitable")) |
+              (
+                [
+                  (if ($p.IsMalicius == true) then "Malware" else empty end),
+                  (if ($p.IsDevelopmentDependency != true and $IsTestDependency != true)) then
+                    (if ($v.Kev == true) then "KEV" else empty end),
+                    (if ($v.ExploitablePath == true) then "Ruta Explotable" else empty end),
+                    (if ($v.Poc == true) then "PoC Pública" else empsty end), 
+                    (if (($v.Severity == "CRITICAL" or ($v.Severity == "HIGH") and ((v.EpssValue // 0 | tonumber) >= 0.10) and $p.IsDirectDependency == true) then "EPSS >= 10% (Directa)" else empty end)
+                  else empty end)
+                ] | select(length > 0) | join(" + ")
+              ) as $reason |
+              select($reason != null and $reason != "") |
+              {
+                PackegeId: $p.Id,
+                VulnId: $v.Id,
+                Severety: ($v.Severity | ascii_upcase),
+                Epss: (if $v.EpssValue != null then ((($v.EpssValue | tonumber) * 10000 | round)/100) else 0 end),
+                IsDirect: ($p.IsDirectDependency // false),
+                IsDev: ($p.IsDevelopmentDependency // false),
+                IsMalicius: ($p.IsMalicius // false),
+                Kev: ($v.Kev // false),
+                Poc: ($v.Poc // false),
+                Reason: $reason
+              }
+            ] | unique | sort_by(.Severity, .PackageId)
+          ')
+
+          local is_empty=$(echo "$violations" | jq 'length == 0')
+          
+          if [ "$is_empty" == "true" ]; then
+            echo "[OK] SCA Aprobado. Las vulnerabilidades encontradas no superan los umbrales de riesgo."
+          else
+            SCA_FAILED=true
+            
+            SCA_CRIT=$(echo "$violations" | jq '[.[] | select(.Severity == "CRITICAL")] | length')
+            SCA_HIGH=$(echo "$violations" | jq '[.[] | select(.Severity == "HIGH")] | length')
+            local fail_pkg_count=$(echo "$violations" | jq '[.[].PackageId] | unique | length')
+            
+            echo "[INFO] RESULTADO SCA (Filtro de Inteligencia de Amenazas)"
+            echo "  - Paquetes Bloqueados : ${fail_pkg_count}"
+            echo "  - Hallazgos CRITICAL  : ${SCA_CRIT}"
+            echo "  - Hallazgos HIGH      : ${SCA_HIGH}"
+            echo ""
+
+            # --- Generar Tabla ASCII 
+            echo " REPORTE GLOBAL DE HALLAZGOS SCA (${fail_pkg_count} Paquetes Bloqueados)"
+            
+            printf "| %-35s | %-16s | %-8s | %-7s | %-6s | %-7s | %-5s | %-4s | %-4s | %-30s |\n" "Package ID" "Vuln ID" "Severity" "EPSS" "Direct" "Dev/Tst" "Malic" "KEV" "PoC" "Razón del Fallo"
+            echo "+-------------------------------------+------------------+----------+---------+--------+---------+-------+------+------+--------------------------------+"
+            
+            # Extraer a TSV y formatear fila por fila. jq corta los strings largos [0:33] para no romper la tabla
+            echo "$violations" | jq -r '.[] | [ .PackageId[0:34], .VulnId, .Severity, "\(.Epss)%", .IsDirect, .IsDev, .IsMalicious, .Kev, .Poc, .Reason[0:29] ] | @tsv' | while IFS=$'\t' read -r pkg vuln sev epss dir dev mal kev poc reason; do
+              printf "| %-35s | %-16s | %-8s | %-7s | %-6s | %-7s | %-5s | %-4s | %-4s | %-30s |\n" "$pkg" "$vuln" "$sev" "$epss" "$dir" "$dev" "$mal" "$kev" "$poc" "$reason"
+            done
+            
+            echo "+-------------------------------------+------------------+----------+---------+--------+---------+-------+------+------+--------------------------------+"
+            echo "##vso[task.logissue type=error] Alerta de seguridad SCA: Revisa la tabla superior para ver las vulnerabilidades activas."
+          fi
+          echo "##[endgroup]"
+        }
+
+        # -- Resumen Final y Decisión Pipeline
+        final_summary() {
+          echo ""
+          echo "              REPORTE FINAL DE CUMPLIMIENTO DE SEGURIDAD (CI/CD)"
+          
+          local sast_status=" PASÓ"
+          local sca_status=" PASÓ"
+          if [ "$SAST_FAILED" = true ]; then sast_status=" FALLÓ"; fi
+          if [ "$SCA_FAILED" = true ]; then sca_status=" FALLÓ"; fi
+          
+          local sast_info="Línea Base: ${BASELINE_ID:-N/A (Scan Directo)}"
+          local sca_info="Políticas cumplidas"
+          if [ "$SCA_FAILED" = true ]; then sca_info="Revisar tabla detallada arriba"; fi
+          
+          echo "+------------+------------+----------+----------+-------------------------------------+"
+          printf "| %-10s | %-10s | %-8s | %-8s | %-35s |\n" "MÓDULO" "ESTADO" "CRÍTICAS" "ALTAS" "INFO ADICIONAL"
+          echo "+------------+------------+----------+----------+-------------------------------------+"
+          printf "| %-10s | %-10s | %-8s | %-8s | %-35s |\n" "SAST" "$sast_status" "$SAST_CRIT" "$SAST_HIGH" "$sast_info"
+          printf "| %-10s | %-10s | %-8s | %-8s | %-35s |\n" "SCA" "$sca_status" "$SCA_CRIT" "$SCA_HIGH" "$sca_info"
+          echo "+------------+------------+----------+----------+-------------------------------------+"
+
+          if [ "$SAST_FAILED" = true ] || [ "$SCA_FAILED" = true ]; then
+            echo ""
+            echo "##vso[task.logissue type=error] FALLO DE SEGURIDAD: Revisa los hallazgos críticos/altos."
+            exit 1
+          fi
+          
+          echo ""
+          echo " Seguridad aprobada: Cumplimiento total de políticas."
+          echo "====================================================================================="
+        }
 
         # -- main
         main() {
-            echo "##vso[group] Preparación y Autenticación"
+            echo "##[group] Preparación y Autenticación"
 
             validate_identifiers
             get_token_iam
             if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" == "null" ]; then
                 get_projectID
             fi
-
+            check_scan_status
             echo "##[endgroup]"
-        }
 
+            sast_baseline_evaluation
+
+            sca_evaluation
+
+            final_summary
+        }
         main
 
     env:
