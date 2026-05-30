@@ -1,7 +1,26 @@
+parameters:
+  - name: cx_client_id
+    type: string
+  - name: cx_secret
+    type: string
+  - name: branch
+    type: string
+  - name: condition
+    type: string
+    default: 'succeeded()'
+  - name: MS_NAME 
+    type: string
+    default: ''
+  - name: continue_on_error
+    type: boolean
+    default: false
+
+
 steps:
   - task: Bash@3
     displayName: 'Breaker - CxOne'
-    continueOnError: true
+    condition: ${{ parameters.condition }}
+    continueOnError: ${{ parameters.continue_on_error }}
     inputs:
       targetType: 'inline'
       script: |
@@ -180,11 +199,14 @@ steps:
               break
             fi 
 
-            local active=$(echo "$API_BODY" | jq -r '
-              if .summaries then
-                [.summaries[] | select((.state | gsub("_";"") | ascii_downcase) != "notexploitable") | .count] | add // 0 
-              else 0 end
-            ')
+          local active=$(echo "$API_BODY" | jq -r '
+            if .summaries then
+              [.summaries[] 
+                | select((.state | ascii_downcase) != "not_exploitable") 
+                | .count
+              ] | add // 0
+            else 0 end
+          ')
 
             if [ "$sev" == "CRITICAL" ]; then SAST_CRIT=$active; fi 
             if [ "$sev" == "HIGH" ]; then SAST_HIGH=$active; fi 
@@ -295,10 +317,10 @@ steps:
           echo "[INFO] Solicitando exportacion SCA a la API CxOne..."
 
           local body="{\"scanId\":\"${SCAN_ID}\",\"fileFormat\":\"ScanReportJson\",\"exportParameters\":{\"hideDevAndTestDependencies\":false,\"showOnlyEffectiveLicenses\":false}}"
-          make_api_request "{CX_URL_AST}/sca/export/requests" "POST" "$body"
+          make_api_request "${CX_URL_AST}/sca/export/requests" "POST" "$body"
 
           if [ "$API_STATUS" -lt 200 ] || [ "$API_STATUS" -gt 299 ]; then
-            echo "##vso[task.logissue type=error] Error: Fallo al solicitar exportación SCA. Código: "$API_STATUS"
+            echo "##vso[task.logissue type=error] Error: Fallo al solicitar exportación SCA. Código: $API_STATUS"
             SCA_FAILED=true
             return
           fi 
@@ -351,8 +373,7 @@ steps:
           
           # -- Reglas de negocio SCA
           local violations=$(echo "$API_BODY" | jq -r '
-            # Con reduce convertimos un array a diccionario, 
-            (reduce .Packages[] as $p ({}; .$[$p.Id] = $p)) as $pkgs |
+            (reduce .Packages[] as $p ({}; .[$p.Id] = $p)) as $pkgs |
             [
               .Vulnerabilities[] |
               . as $v |
@@ -361,25 +382,27 @@ steps:
               (
                 [
                   (if ($p.IsMalicius == true) then "Malware" else empty end),
-                  (if ($p.IsDevelopmentDependency != true and $IsTestDependency != true)) then
+                  (if ($p.IsDevelopmentDependency != true and $p.IsTestDependency != true) then
                     (if ($v.Kev == true) then "KEV" else empty end),
                     (if ($v.ExploitablePath == true) then "Ruta Explotable" else empty end),
-                    (if ($v.Poc == true) then "PoC Pública" else empsty end), 
-                    (if (($v.Severity == "CRITICAL" or ($v.Severity == "HIGH") and ((v.EpssValue // 0 | tonumber) >= 0.10) and $p.IsDirectDependency == true) then "EPSS >= 10% (Directa)" else empty end)
+                    (if ($v.Poc == true) then "PoC Pública" else empty end), 
+                    (if (($v.Severity == "CRITICAL" or $v.Severity == "HIGH") and (($v.EpssValue // 0 | tonumber) >= 0.10) and $p.IsDirectDependency == true) then "EPSS >= 10% (Directa)" else empty end)
                   else empty end)
                 ] | select(length > 0) | join(" + ")
               ) as $reason |
               select($reason != null and $reason != "") |
               {
-                PackegeId: $p.Id,
+                PackageId: $p.Id,
                 VulnId: $v.Id,
-                Severety: ($v.Severity | ascii_upcase),
+                Severity: ($v.Severity | ascii_upcase),
                 Epss: (if $v.EpssValue != null then ((($v.EpssValue | tonumber) * 10000 | round)/100) else 0 end),
                 IsDirect: ($p.IsDirectDependency // false),
                 IsDev: ($p.IsDevelopmentDependency // false),
-                IsMalicius: ($p.IsMalicius // false),
+                IsMalicious: ($p.IsMalicious // false),
                 Kev: ($v.Kev // false),
                 Poc: ($v.Poc // false),
+                RiskState: ($v.RiskState // "N/A"),
+                ExplPath: ($v.ExploitablePath // false),
                 Reason: $reason
               }
             ] | unique | sort_by(.Severity, .PackageId)
@@ -404,16 +427,15 @@ steps:
 
             # --- Generar Tabla ASCII 
             echo " REPORTE GLOBAL DE HALLAZGOS SCA (${fail_pkg_count} Paquetes Bloqueados)"
+            echo "+----------------------------------------+-----------------+-------+---------+--------+-------+--------+-------+----------+--------+--------+---------------------------------+"
+            printf "| %-38s | %-15s | %-5s | %-7s | %-6s | %-5s | %-6s | %-5s | %-8s | %-6s | %-6s | %-31s |\n" "Package ID" "Vuln ID" "Malic" "RiskSt" "DevTst" "KEV" "ExPath" "PoC" "Severity" "EPSS" "Direct" "Razón del Fallo"
+            echo "+----------------------------------------+-----------------+-------+---------+--------+-------+--------+-------+----------+--------+--------+---------------------------------+"
             
-            printf "| %-35s | %-16s | %-8s | %-7s | %-6s | %-7s | %-5s | %-4s | %-4s | %-30s |\n" "Package ID" "Vuln ID" "Severity" "EPSS" "Direct" "Dev/Tst" "Malic" "KEV" "PoC" "Razón del Fallo"
-            echo "+-------------------------------------+------------------+----------+---------+--------+---------+-------+------+------+--------------------------------+"
-            
-            # Extraer a TSV y formatear fila por fila. jq corta los strings largos [0:33] para no romper la tabla
-            echo "$violations" | jq -r '.[] | [ .PackageId[0:34], .VulnId, .Severity, "\(.Epss)%", .IsDirect, .IsDev, .IsMalicious, .Kev, .Poc, .Reason[0:29] ] | @tsv' | while IFS=$'\t' read -r pkg vuln sev epss dir dev mal kev poc reason; do
-              printf "| %-35s | %-16s | %-8s | %-7s | %-6s | %-7s | %-5s | %-4s | %-4s | %-30s |\n" "$pkg" "$vuln" "$sev" "$epss" "$dir" "$dev" "$mal" "$kev" "$poc" "$reason"
+            echo "$violations" | jq -r '.[] | [ .PackageId[0:38], .VulnId, (.IsMalicious | tostring), (.RiskState[0:7]), (.IsDev | tostring), (.Kev | tostring), (.ExplPath | tostring), (.Poc | tostring), .Severity, "\(.Epss)%", (.IsDirect | tostring), .Reason[0:31] ] | @tsv' | while IFS=$'\t' read -r pkg vuln mal risk dev kev expl poc sev epss dir reason; do
+              printf "| %-38s | %-15s | %-5s | %-7s | %-6s | %-5s | %-6s | %-5s | %-8s | %-6s | %-6s | %-31s |\n" "$pkg" "$vuln" "$mal" "$risk" "$dev" "$kev" "$expl" "$poc" "$sev" "$epss" "$dir" "$reason"
             done
             
-            echo "+-------------------------------------+------------------+----------+---------+--------+---------+-------+------+------+--------------------------------+"
+            echo "+----------------------------------------+-----------------+-------+---------+--------+-------+--------+-------+----------+--------+--------+---------------------------------+"
             echo "##vso[task.logissue type=error] Alerta de seguridad SCA: Revisa la tabla superior para ver las vulnerabilidades activas."
           fi
           echo "##[endgroup]"
@@ -421,25 +443,23 @@ steps:
 
         # -- Resumen Final y Decisión Pipeline
         final_summary() {
-          echo ""
-          echo "              REPORTE FINAL DE CUMPLIMIENTO DE SEGURIDAD (CI/CD)"
+          local sast_status=" PASO"
+          local sca_status=" PASO"
+          if [ "$SAST_FAILED" = true ]; then sast_status=" FALLO"; fi
+          if [ "$SCA_FAILED" = true ]; then sca_status=" FALLO"; fi
           
-          local sast_status=" PASÓ"
-          local sca_status=" PASÓ"
-          if [ "$SAST_FAILED" = true ]; then sast_status=" FALLÓ"; fi
-          if [ "$SCA_FAILED" = true ]; then sca_status=" FALLÓ"; fi
-          
-          local sast_info="Línea Base: ${BASELINE_ID:-N/A (Scan Directo)}"
-          local sca_info="Políticas cumplidas"
+          local sast_info="Linea Base: ${BASELINE_ID:-N/A (Scan Directo)}"
+          local sca_info="Politicas cumplidas"
           if [ "$SCA_FAILED" = true ]; then sca_info="Revisar tabla detallada arriba"; fi
-          
-          echo "+------------+------------+----------+----------+-------------------------------------+"
-          printf "| %-10s | %-10s | %-8s | %-8s | %-35s |\n" "MÓDULO" "ESTADO" "CRÍTICAS" "ALTAS" "INFO ADICIONAL"
-          echo "+------------+------------+----------+----------+-------------------------------------+"
-          printf "| %-10s | %-10s | %-8s | %-8s | %-35s |\n" "SAST" "$sast_status" "$SAST_CRIT" "$SAST_HIGH" "$sast_info"
-          printf "| %-10s | %-10s | %-8s | %-8s | %-35s |\n" "SCA" "$sca_status" "$SCA_CRIT" "$SCA_HIGH" "$sca_info"
-          echo "+------------+------------+----------+----------+-------------------------------------+"
 
+          echo "-------------------------------------------------------------------------------------------------"
+          echo "|                          REPORTE FINAL DE CUMPLIMIENTO DE SEGURIDAD                           |"
+          echo "+----------+------------+----------+----------+-------------------------------------------------+"
+          printf "| %-8s | %-10s | %-8s | %-8s | %-47s |\n" "MODULO" "ESTADO" "CRITICAS" "ALTAS" "INFO ADICIONAL"
+          echo "+----------+------------+----------+----------+-------------------------------------------------+"
+          printf "| %-8s | %-10s | %-8s | %-8s | %-47s |\n" "SAST" "$sast_status" "$SAST_CRIT" "$SAST_HIGH" "$sast_info"
+          printf "| %-8s | %-10s | %-8s | %-8s | %-47s |\n" "SCA" "$sca_status" "$SCA_CRIT" "$SCA_HIGH" "$sca_info"
+          echo "+----------+------------+----------+----------+-------------------------------------------------+"
           if [ "$SAST_FAILED" = true ] || [ "$SCA_FAILED" = true ]; then
             echo ""
             echo "##vso[task.logissue type=error] FALLO DE SEGURIDAD: Revisa los hallazgos críticos/altos."
@@ -472,10 +492,10 @@ steps:
         main
 
     env:
-      PROJECT_NAME_ENV: ${{ parameters.project_name }}
       BRANCH_ENV: ${{ parameters.branch }}
       CX_CLIENT_ID: ${{ parameters.cx_client_id }}
       CX_CLIENT_SECRET: ${{ parameters.cx_secret }}
-      SCAN_ID_ENV: ${{ parameters.scan_id }}
-      PROJECT_ID_ENV: ${{ parameters.project_id }}
+      SCAN_ID_ENV: $(ScanID)
+      PROJECT_ID_ENV: $(ProjectID)
+      PROJECT_NAME_ENV: $(CX_PROJECT_NAME)
 
